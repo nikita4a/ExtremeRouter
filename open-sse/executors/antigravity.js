@@ -162,6 +162,8 @@ export class AntigravityExecutor extends BaseExecutor {
   buildUrl(model, stream, urlIndex = 0) {
     const baseUrls = this.getBaseUrls();
     const baseUrl = baseUrls[urlIndex] || baseUrls[0];
+    // Cached for parseError diagnostics on a bare/gateway-level rejection.
+    this._lastRequestHost = baseUrl;
     // Image generation MUST use non-streaming generateContent
     const forceNonStream = isImageModel(model);
     const action = (stream && !forceNonStream) ? "streamGenerateContent?alt=sse" : "generateContent";
@@ -182,8 +184,72 @@ export class AntigravityExecutor extends BaseExecutor {
     };
   }
 
+  /**
+   * Antigravity-specific error parsing.
+   *
+   * Google's gateway/IAM layer rejects some requests with a BARE status and an
+   * empty body (no JSON error payload). BaseExecutor.parseError then degrades
+   * that to the useless string "HTTP 403", which is exactly what landed in the
+   * connection's lastError. Surface gateway-level diagnostics instead: which
+   * host, which project id went out (and whether it was fabricated), and any
+   * response headers Google left behind (IAM rejections sometimes carry
+   * www-authenticate / x-goog-* / grpc-status details that the body omits).
+   */
+  parseError(response, bodyText) {
+    const status = response?.status;
+    const hasBody = typeof bodyText === "string" && bodyText.trim().length > 0;
+    if (hasBody) {
+      return { status, message: bodyText };
+    }
+
+    // Empty body → gateway-level rejection. Collect diagnostic headers only
+    // (never echo the Authorization token or the raw key).
+    const headerHints = [];
+    if (response?.headers?.forEach) {
+      response.headers.forEach((value, key) => {
+        if (/^(www-authenticate|x-goog|x-request-id|grpc|server|via|cf-ray|date)$/i.test(key)) {
+          headerHints.push(`${key}: ${String(value).slice(0, 160)}`);
+        }
+      });
+    }
+
+    const host = this._lastRequestHost || this.getBaseUrls?.()?.[0] || "unknown-host";
+    const project = this._lastRequestProject;
+    const projectNote = project
+      ? `project='${project}'`
+      : "project=(not captured)";
+    const headerNote = headerHints.length
+      ? ` headers=[${headerHints.join(" | ")}]`
+      : " headers=(none captured)";
+
+    return {
+      status,
+      message:
+        `HTTP ${status} (empty body — gateway/IAM-level rejection, not an application error) ` +
+        `host=${host} ${projectNote}${headerNote}`,
+      rawBody: "",
+    };
+  }
+
   transformRequest(model, body, stream, credentials) {
-    const projectId = credentials?.projectId || this.generateProjectId();
+    const storedProjectId = credentials?.projectId;
+    const projectId = storedProjectId || this.generateProjectId();
+
+    // A fabricated project id is NOT a provisioned Google project. It has been
+    // observed to work most of the time on the canary host, but it is also
+    // consistent with the intermittent, body-less 403s this provider returns
+    // (gateway/IAM-level rejection). Make the condition visible instead of
+    // silently shipping a random id.
+    if (!storedProjectId) {
+      dbg(
+        "PROJECT",
+        `antigravity: no stored projectId for ${credentials?.email || credentials?.connectionId || "connection"} — ` +
+        `sending locally generated '${projectId}'. Google may reject this at the gateway with a bare 403. ` +
+        `Provision a real id via loadCodeAssist/onboardUser (reconnect, or wait for the runtime projectId backfill).`
+      );
+    }
+    // Cached for parseError diagnostics on a bare/gateway-level rejection.
+    this._lastRequestProject = projectId;
 
     // ─── Image generation: completely different request structure ───
     if (isImageModel(model)) {

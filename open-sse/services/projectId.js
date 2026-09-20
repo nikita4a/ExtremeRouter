@@ -208,15 +208,19 @@ async function fetchProjectId(accessToken, signal, provider) {
     const projectId = extractProjectId(data);
     if (projectId) return projectId;
 
-    // Providers using the daily-cloudcode-pa endpoint (e.g. antigravity) do not
-    // support onboardUser provisioning — their executors generate random project
-    // IDs locally. Skip onboardUser to avoid the 10s burn (5 attempts × 2s) per
-    // connection on every token refresh.
-    const onboardEndpoint = CLOUD_CODE_API[provider]?.onboardUser || "";
-    if (onboardEndpoint.includes("daily-")) {
-        console.warn(`[ProjectId] Provider "${provider}" uses daily endpoint; skipping onboardUser (executor generates project ID locally)`);
-        return null;
-    }
+    // loadCodeAssist returned no project — onboardUser is what provisions one
+    // for a fresh account. This used to be skipped for the "daily-" canary
+    // endpoints under the assumption that "the executor generates project IDs
+    // locally", but that generated id is NOT a provisioned Google project:
+    // every stored antigravity connection had projectId="" and the fake id was
+    // what went out on the wire (DB-verified 2026-09-20). Attempt onboardUser
+    // for every provider; if Google still won't provision we return null and
+    // the caller keeps its fallback — no worse than skipping, and now the
+    // happy path can actually persist a real id.
+    //
+    // Anti-abuse: onboardUser itself is bounded (MAX_ATTEMPTS=2, 12s+jitter)
+    // and getProjectIdForConnection() negative-caches failures, so removing
+    // the skip does not reintroduce a per-request retry storm.
 
     // Determine the tier to use for onboarding
     let tierID = "legacy-tier";

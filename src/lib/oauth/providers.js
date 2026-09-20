@@ -35,6 +35,7 @@ import {
   getOAuthClientMetadata,
 } from "./constants/oauth";
 import { tlsFetch } from "open-sse/utils/tlsClient.js";
+import { CLOUD_CODE_API } from "open-sse/config/appConstants.js";
 import { XAI_CONFIG, XAI_PKCE_VERIFIER_BYTES } from "./constants/xai";
 import { ZcodeService } from "./services/zcode";
 import {
@@ -479,52 +480,113 @@ const PROVIDERS = {
       });
       const userInfo = userInfoRes.ok ? await userInfoRes.json() : {};
 
-      // Load Code Assist to get project ID and tier
+      // Provisioning endpoints: try the registry-configured (production) host
+      // first, then the canary host that actually serves Antigravity chat
+      // traffic. Production has been observed to 429 every account for chat
+      // (2026-08-13); the canary is the host CLOUD_CODE_API pins for runtime
+      // projectId lookups. The previous flow only ever tried production and
+      // silently persisted "" when it failed — which left every request sending
+      // a locally fabricated project id (DB-verified 2026-09-20).
+      const provisionHosts = [
+        ANTIGRAVITY_CONFIG.loadCodeAssistEndpoint,
+        CLOUD_CODE_API?.antigravity?.loadCodeAssist,
+      ].filter(Boolean);
+
+      const onboardHosts = [
+        ANTIGRAVITY_CONFIG.onboardUserEndpoint,
+        CLOUD_CODE_API?.antigravity?.onboardUser,
+      ].filter(Boolean);
+
+      // Walk candidate loadCodeAssist hosts until one yields a project id.
       let projectId = "";
       let tierId = "legacy-tier";
-      try {
-        const loadRes = await fetch(ANTIGRAVITY_CONFIG.loadCodeAssistEndpoint, {
-          method: "POST",
-          headers: loadHeaders,
-          body: JSON.stringify({ metadata }),
-        });
-        if (loadRes.ok) {
+      let lastLoadError = null;
+      for (const endpoint of provisionHosts) {
+        try {
+          const loadRes = await fetch(endpoint, {
+            method: "POST",
+            headers: loadHeaders,
+            body: JSON.stringify({ metadata }),
+          });
+          if (!loadRes.ok) {
+            lastLoadError = `HTTP ${loadRes.status} @ ${endpoint}`;
+            continue;
+          }
           const data = await loadRes.json();
-          projectId = data.cloudaicompanionProject?.id || data.cloudaicompanionProject || "";
+          const candidate = data.cloudaicompanionProject?.id || data.cloudaicompanionProject || "";
           if (Array.isArray(data.allowedTiers)) {
             for (const tier of data.allowedTiers) {
               if (tier.isDefault && tier.id) {
-                tierId = tier.id.trim();
+                tierId = String(tier.id).trim();
                 break;
               }
             }
           }
+          if (candidate && typeof candidate === "string" && candidate.trim()) {
+            projectId = candidate.trim();
+            break;
+          }
+          lastLoadError = `no cloudaicompanionProject @ ${endpoint}`;
+        } catch (e) {
+          lastLoadError = `${e?.message || e} @ ${endpoint}`;
         }
-      } catch (e) {
-        console.log("Failed to load code assist:", e);
+      }
+      if (!projectId && lastLoadError) {
+        console.warn(`[Antigravity] loadCodeAssist produced no projectId (${lastLoadError})`);
       }
 
-      // Fire-and-forget onboarding — does not block DB save
-      if (projectId) {
-        const doOnboard = async () => {
-          for (let i = 0; i < 10; i++) {
-            try {
-              const onboardRes = await fetch(ANTIGRAVITY_CONFIG.onboardUserEndpoint, {
-                method: "POST",
-                headers: loadHeaders,
-                body: JSON.stringify({ tierId, metadata }),
-              });
-              if (onboardRes.ok) {
-                const result = await onboardRes.json();
-                if (result.done === true) break;
-              }
-            } catch (e) {
-              break;
-            }
-            await new Promise(resolve => setTimeout(resolve, 5000));
+      // onboardUser is what actually provisions a project for a fresh account.
+      // The previous flow only ran it when projectId was already present (so it
+      // could never rescue an empty one) and never awaited it, so an id issued
+      // during onboarding was never persisted. Run it whenever we have a token,
+      // bounded, and adopt any project id it returns.
+      const onboardExtract = (result) => {
+        if (!result || typeof result !== "object") return "";
+        const candidates = [
+          result.response?.cloudaicompanionProject,
+          result.cloudaicompanionProject,
+          result.response?.project,
+          result.project,
+          result.response?.projectId,
+          result.projectId,
+          result.project_id,
+          result.response?.project_id,
+        ];
+        for (const c of candidates) {
+          if (typeof c === "string" && c.trim()) return c.trim();
+          if (c && typeof c === "object" && typeof c.id === "string" && c.id.trim()) return c.id.trim();
+        }
+        return "";
+      };
+
+      const MAX_ONBOARD_ATTEMPTS = 3;
+      const ONBOARD_SPACING_MS = 3000;
+      for (let i = 0; i < MAX_ONBOARD_ATTEMPTS; i++) {
+        if (i > 0) await new Promise((r) => setTimeout(r, ONBOARD_SPACING_MS));
+        let done = false;
+        for (const endpoint of onboardHosts) {
+          try {
+            const onboardRes = await fetch(endpoint, {
+              method: "POST",
+              headers: loadHeaders,
+              body: JSON.stringify({ tierId, metadata }),
+            });
+            if (!onboardRes.ok) continue;
+            const result = await onboardRes.json();
+            const issued = onboardExtract(result);
+            if (issued && !projectId) projectId = issued;
+            if (result.done === true) { done = true; break; }
+          } catch {
+            /* try next host */
           }
-        };
-        doOnboard().catch(() => {});
+        }
+        if (done || projectId) break;
+      }
+
+      if (!projectId) {
+        console.warn("[Antigravity] connect completed WITHOUT a provisioned projectId — requests will fall back to a locally generated id, which Google may reject at the gateway (bare 403).");
+      } else {
+        console.log(`[Antigravity] connect provisioned projectId=${projectId}`);
       }
 
       return { userInfo, projectId };
