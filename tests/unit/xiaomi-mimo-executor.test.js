@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 import { XiaomiMimoExecutor, __test__ } from "../../open-sse/executors/xiaomi-mimo.js";
 import { getExecutor } from "../../open-sse/executors/index.js";
 
-const { bareModel, COOKIE_KEY } = __test__;
+const { bareModel, COOKIE_KEY, COOKIE_REGION_KEY } = __test__;
 
 // BaseExecutor.execute calls buildHeaders(credentials, stream, model, ...) —
 // the 3rd argument is the model. These credentials objects mirror that shape.
@@ -26,6 +26,21 @@ describe("xiaomi-mimo executor", () => {
     expect(ex.buildUrl("mimo-x-pro-preview", true, 0, CLAUDE_T)).toBe(expected);
     // body.model arrives as `xiaomi/<id>` via upstreamModelId
     expect(ex.buildUrl("xiaomi/mimo-x-flash-preview", true, 0, OPENAI_T)).toBe(expected);
+  });
+
+  it("routes Preview chat to the cluster the handshake minted the cookie on", () => {
+    // Regression: handshake succeeded on cn but chat went to sgp → 401.
+    // The region returned by getMimoAccountSession must drive the chat URL.
+    const cnCreds = { ...OPENAI_T, [COOKIE_REGION_KEY]: "cn" };
+    expect(ex.buildUrl("mimo-x-pro-preview", true, 0, cnCreds)).toBe(
+      "https://mimo-server-cn.xiaomimimo.com/api/route/chat/completions"
+    );
+    const sgCreds = { ...OPENAI_T, [COOKIE_REGION_KEY]: "sgp" };
+    expect(ex.buildUrl("mimo-x-flash-preview", true, 0, sgCreds)).toBe(
+      "https://mimo-server-sgp.xiaomimimo.com/api/route/chat/completions"
+    );
+    // Cloud models are unaffected by the handshake region.
+    expect(ex.buildUrl("mimo-v2.5-pro", true, 0, cnCreds)).toBe(OPENAI_T.runtimeTransport.baseUrl);
   });
 
   it("keeps the sourceFormat-matched endpoint for cloud models", () => {

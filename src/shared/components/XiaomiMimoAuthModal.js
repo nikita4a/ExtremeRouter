@@ -62,7 +62,12 @@ export default function XiaomiMimoAuthModal({ isOpen, onSuccess, onClose }) {
       const res = await fetch("/api/oauth/xiaomi-mimo/api-key", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ desktopLinked: true, passToken: detectResult?.passToken }),
+        body: JSON.stringify({
+          desktopLinked: true,
+          passToken: detectResult?.passToken,
+          userId: detectResult?.userId,
+          cUserId: detectResult?.cUserId,
+        }),
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error || "Import failed");

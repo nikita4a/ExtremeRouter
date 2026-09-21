@@ -12,7 +12,8 @@ const VALIDATE_URL = "https://api.xiaomimimo.com/v1/models";
  */
 export async function POST(request) {
   try {
-    const { apiKey, desktopLinked, passToken: bodyPassToken } = await request.json();
+    const { apiKey, desktopLinked, passToken: bodyPassToken, userId: bodyUserId, cUserId: bodyCUserId } =
+      await request.json();
 
     // Desktop-only import: no sk- key, just the account passToken. This path
     // skips cloud validation — the passToken itself is the credential.
@@ -28,8 +29,11 @@ export async function POST(request) {
         providerSpecificData: {
           authMethod: "desktop_session",
           mimoPassToken: passToken,
-          mimoUserId: desktop?.userId || null,
-          mimoCUserId: desktop?.cUserId || null,
+          // A fresh Desktop read can legitimately be null (Desktop reopened
+          // between auto-detect and this save) — fall back to what the client
+          // already captured during auto-detect rather than losing it.
+          mimoUserId: desktop?.userId || bodyUserId || null,
+          mimoCUserId: desktop?.cUserId || bodyCUserId || null,
         },
         testStatus: "active",
       });
