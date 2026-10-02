@@ -90,7 +90,10 @@ async function readRaw() {
 }
 
 // Nested objects that must deep-merge with defaults (PATCH often sends a partial).
-const NESTED_SETTING_KEYS = ["circuitBreaker", "healthMonitor", "webhookAlertEvents"];
+// `providerStrategies` is a per-provider map: without a key-level merge, a dashboard
+// save for ANY provider sends a full snapshot and silently erases the other
+// providers' entries (e.g. conol-web's round-robin falls back to fill-first).
+const NESTED_SETTING_KEYS = ["circuitBreaker", "healthMonitor", "webhookAlertEvents", "providerStrategies"];
 
 // Merge raw settings with defaults; backward-compat for missing keys
 function mergeWithDefaults(raw) {

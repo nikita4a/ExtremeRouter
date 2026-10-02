@@ -156,13 +156,40 @@ def upsert_provider_connection(cursor, entry, session_token, expires, now_ts):
     # executor 401s, markAccountUnavailable parks the connection, and it stays
     # parked until an external refresh (conol_refresh.py) plus a re-run of this
     # importer. Schedule that pair at an interval safely under 7 days.
-    payload = {
+    # MERGE with the existing row instead of replacing `data` wholesale. ER keeps
+    # runtime state inside that same JSON blob:
+    #   - lastUsedAt / consecutiveUseCount  → sticky-LRU selection (auth.js:215-234)
+    #   - lastError / errorCode / modelLockUntil → set by markAccountUnavailable
+    #   - connectionProxy* / connectionProxyPoolId → per-connection proxy config
+    # A wholesale write reset rotation history and, worse, un-parked accounts that
+    # ER had correctly locked after rate limiting — on every single re-import.
+    merged = {}
+    if existing and existing[1]:
+        try:
+            loaded = json.loads(existing[1])
+            if isinstance(loaded, dict):
+                merged = loaded
+        except (json.JSONDecodeError, TypeError, ValueError):
+            print(f"  ! unparseable data JSON for {email}; rebuilding it", file=sys.stderr)
+
+    # Drop every key resolveConolCredentials() ranks ABOVE apiKey, otherwise a
+    # stale cookie there would shadow the token we are importing.
+    merged.pop("cookie", None)
+    provider_data = dict(merged.get("providerSpecificData") or {})
+    for shadowing_key in ("cookie", COOKIE_NAME, "sessionToken"):
+        provider_data.pop(shadowing_key, None)
+
+    token_changed = (merged.get("apiKey") or "") != (session_token or "")
+    merged.update({
         "apiKey": session_token or "",
-        "baseUrl": "https://conol.ai",
-        "testStatus": "unknown",
-        "providerSpecificData": {},
-    }
-    data_json = json.dumps(payload, ensure_ascii=False)
+        "baseUrl": merged.get("baseUrl") or "https://conol.ai",
+        # Reset the verdict only when the token actually changed: idempotent
+        # re-runs must not wipe a result that providers/test-batch wrote for a
+        # token that is still in place.
+        "testStatus": "unknown" if token_changed else merged.get("testStatus", "unknown"),
+        "providerSpecificData": provider_data,
+    })
+    data_json = json.dumps(merged, ensure_ascii=False)
 
     if existing:
         row_id = existing[0]
@@ -182,7 +209,8 @@ def upsert_provider_connection(cursor, entry, session_token, expires, now_ts):
 
 
 def dt_now():
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.") + f"{datetime.now(timezone.utc).microsecond:06d}Z"
+    now = datetime.now(timezone.utc)
+    return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond:06d}Z"
 
 
 def import_pool(pool_path, db_path, dry_run=False, only_live=False):
@@ -291,6 +319,48 @@ def selfcheck():
     is_a = conn.execute("SELECT isActive FROM providerConnections WHERE email='test@example.com'").fetchone()[0]
     assert is_a == 0, f"isActive should be 0, got {is_a}"
     print("[PASS] Dedup by email works, isActive correctly updated")
+
+    # 4. Re-import must MERGE: ER owns runtime state inside the same `data` JSON.
+    conn.execute("DELETE FROM providerConnections")
+    seed = json.dumps({
+        "apiKey": "OLDTOKEN", "baseUrl": "https://conol.ai", "testStatus": "active",
+        "lastUsedAt": "2026-10-01T00:00:00.000Z", "consecutiveUseCount": 2,
+        "modelLockUntil": "2026-10-09T00:00:00.000Z",
+        "providerSpecificData": {"cookie": "STALE", "connectionProxyEnabled": False},
+    })
+    conn.execute(
+        "INSERT INTO providerConnections VALUES(?, 'conol-web', 'cookie', ?, ?, NULL, 1, ?, ?, ?)",
+        ("merge-id", "mergeacct", "merge@example.com", seed, dt_now(), dt_now()),
+    )
+    upsert_provider_connection(
+        conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
+        "NEWTOKEN", time.time() + 600, time.time(),
+    )
+    conn.commit()
+    after = json.loads(conn.execute(
+        "SELECT data FROM providerConnections WHERE email='merge@example.com'"
+    ).fetchone()[0])
+    assert after["apiKey"] == "NEWTOKEN", f"token not imported: {after['apiKey']}"
+    assert "cookie" not in after["providerSpecificData"], "stale cookie would shadow apiKey"
+    assert after["providerSpecificData"].get("connectionProxyEnabled") is False, "proxy config lost"
+    assert after["lastUsedAt"] == "2026-10-01T00:00:00.000Z", "LRU history reset by re-import"
+    assert after["consecutiveUseCount"] == 2, "sticky counter reset by re-import"
+    assert after["modelLockUntil"] == "2026-10-09T00:00:00.000Z", "health lock cleared by re-import"
+    assert after["testStatus"] == "unknown", "verdict for a replaced token must reset"
+    # Same token again → verdict preserved this time.
+    merged_row = dict(after, testStatus="active")
+    conn.execute("UPDATE providerConnections SET data=? WHERE email='merge@example.com'",
+                 (json.dumps(merged_row),))
+    upsert_provider_connection(
+        conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
+        "NEWTOKEN", time.time() + 600, time.time(),
+    )
+    conn.commit()
+    kept = json.loads(conn.execute(
+        "SELECT data FROM providerConnections WHERE email='merge@example.com'"
+    ).fetchone()[0])
+    assert kept["testStatus"] == "active", "idempotent re-run must not wipe a live verdict"
+    print("[PASS] re-import merges: runtime state kept, stale cookie dropped, verdict reset only on token change")
 
     conn.close()
     _os.remove(tmp)
