@@ -15,13 +15,12 @@ from datetime import datetime, timezone
 
 NOW = time.time()
 COOKIE_NAME = "__Secure-better-auth.session_token"
+_SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 _HOME_CANDIDATES = [
     os.environ.get("USERPROFILE"),
     os.path.expanduser("~"),
-    r"C:\Users\User",
-    # script is at <root>/tmp/er-fork/ExtremeRouter/scripts/ -> walk up to the user home
-    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))),
+    # <home>/tmp/er-fork/ExtremeRouter/scripts -> <home>
+    os.path.abspath(os.path.join(_SCRIPT_DIR, "..", "..", "..", "..")),
 ]
 _HOME_CANDIDATES = [h for h in _HOME_CANDIDATES if h]
 
@@ -138,14 +137,19 @@ def upsert_provider_connection(cursor, entry, session_token, expires, now_ts):
         (email,)
     ).fetchone()
 
-    # Build providerSpecificData
-    provider_data = {"cookie": session_token or ""}
-
+    # The cookie credential is stored in `apiKey`, deliberately NOT in
+    # `providerSpecificData.cookie`:
+    #   - resolveConolCredentials() reads providerSpecificData.cookie BEFORE apiKey, so
+    #     a value there would win forever;
+    #   - runtime auto-refresh (open-sse/handlers/chatCore.js) persists a renewed cookie
+    #     via updateProviderConnection(connId, { apiKey: result.refreshedCookie }).
+    # Storing under providerSpecificData.cookie would shadow every refresh with the
+    # stale token: refresh logs success, requests keep sending the dead cookie.
     payload = {
-        "apiKey": "",
+        "apiKey": session_token or "",
         "baseUrl": "https://conol.ai",
         "testStatus": "unknown",
-        "providerSpecificData": provider_data,
+        "providerSpecificData": {},
     }
     data_json = json.dumps(payload, ensure_ascii=False)
 
