@@ -84,9 +84,15 @@ def extract_session_token(cookies_path):
     if not cookies_path or not os.path.exists(cookies_path):
         return None, None
     try:
-        with open(cookies_path) as f:
+        with open(cookies_path, encoding="utf-8") as f:
             cookies = json.load(f)
-    except (json.JSONDecodeError, Exception):
+    except (json.JSONDecodeError, OSError) as exc:
+        # Narrow on purpose: an unreadable cookie file must not masquerade as an
+        # expired token (which would silently import the row with isActive=0).
+        print(f"  ! cannot read cookies {cookies_path}: {exc}", file=sys.stderr)
+        return None, None
+    if not isinstance(cookies, list):
+        print(f"  ! unexpected cookie file shape {cookies_path}: {type(cookies).__name__}", file=sys.stderr)
         return None, None
     for c in cookies:
         if isinstance(c, dict) and c.get("name") == COOKIE_NAME:
