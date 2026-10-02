@@ -192,6 +192,21 @@ def upsert_provider_connection(cursor, entry, session_token, expires, now_ts):
         provider_data.pop(shadowing_key, None)
 
     token_changed = (merged.get("apiKey") or "") != (session_token or "")
+    if token_changed:
+        # Credential-health state describes the DEAD token. isModelLockActive()
+        # (open-sse/services/accountFallback.js:191-196) reads the flat
+        # modelLock_<model> / modelLock___all keys off this same JSON, so keeping
+        # them would leave a freshly refreshed account parked — which defeats the
+        # refresh + re-import cadence that is the only way these tokens renew.
+        # Account-level state (lastUsedAt, proxy config) is about the account, not
+        # the credential, so it survives.
+        for stale_key in list(merged):
+            if stale_key.startswith("modelLock_"):
+                merged.pop(stale_key, None)
+        for stale_key in ("lastError", "lastErrorType", "errorCode", "backoffLevel",
+                          "consecutiveUseCount", "status",
+                          "quotaExhaustedAt", "quotaResetsAt"):
+            merged.pop(stale_key, None)
     merged.update({
         "apiKey": session_token or "",
         "baseUrl": merged.get("baseUrl") or "https://conol.ai",
@@ -302,7 +317,10 @@ def selfcheck():
     assert result2 == token2, f"normalize fail (wrapped): {result2} != {token2}"
     print("[PASS] normalizeConolCookie passes through already-wrapped value")
 
-    # 3. Dedup by email
+    # 3. Dedup + isActive, driven through the REAL upsert_provider_connection.
+    #    A private re-implementation would prove nothing about the shipped code —
+    #    an earlier version of this check did exactly that and kept passing after
+    #    the credential placement changed underneath it.
     import tempfile
     import os as _os
     tmp = _os.path.join(tempfile.gettempdir(), f"conol_selfcheck_{int(time.time())}.db")
@@ -313,66 +331,80 @@ def selfcheck():
         name TEXT, email TEXT, priority INTEGER, isActive INTEGER DEFAULT 1,
         data TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL
     );""")
+    cur = conn.cursor()
+    entry = {"email": "test@example.com", "name": "testacct"}
 
-    def _upsert(c, email, live):
-        existing = c.execute("SELECT id FROM providerConnections WHERE provider='conol-web' AND email=?", (email,)).fetchone()
-        uid = existing[0] if existing else str(uuid.uuid4())
-        payload = json.dumps({"providerSpecificData": {"cookie": "tok" if live else ""}})
-        if existing:
-            c.execute("UPDATE providerConnections SET isActive=?, data=?, updatedAt=? WHERE id=?", (1 if live else 0, payload, dt_now(), uid))
-        else:
-            c.execute("INSERT INTO providerConnections VALUES(?, 'conol-web', 'cookie', ?, ?, NULL, ?, ?, ?, ?)",
-                      (uid, email.split('@')[0], email, 1 if live else 0, payload, dt_now(), dt_now()))
-
-    _upsert(conn, "test@example.com", True)
-    _upsert(conn, "test@example.com", False)  # same email → update, not create
-    cnt = conn.execute("SELECT COUNT(*) FROM providerConnections WHERE email='test@example.com'").fetchone()[0]
+    upsert_provider_connection(cur, entry, "tok1", time.time() + 604800, time.time())
+    upsert_provider_connection(cur, entry, "tok1", time.time() - 10, time.time())
+    conn.commit()
+    cnt = conn.execute(
+        "SELECT COUNT(*) FROM providerConnections WHERE email='test@example.com'").fetchone()[0]
     assert cnt == 1, f"Dedup fail: {cnt} != 1"
-    is_a = conn.execute("SELECT isActive FROM providerConnections WHERE email='test@example.com'").fetchone()[0]
-    assert is_a == 0, f"isActive should be 0, got {is_a}"
-    print("[PASS] Dedup by email works, isActive correctly updated")
+    is_a = conn.execute(
+        "SELECT isActive FROM providerConnections WHERE email='test@example.com'").fetchone()[0]
+    assert is_a == 0, f"an expired token must set isActive=0, got {is_a}"
+    print("[PASS] dedup + isActive via the real upsert_provider_connection")
 
-    # 4. Re-import must MERGE: ER owns runtime state inside the same `data` JSON.
+    # 4. Re-import must MERGE, and must clear health state that described a dead token.
     conn.execute("DELETE FROM providerConnections")
     seed = json.dumps({
         "apiKey": "OLDTOKEN", "baseUrl": "https://conol.ai", "testStatus": "active",
-        "lastUsedAt": "2026-10-01T00:00:00.000Z", "consecutiveUseCount": 2,
-        "modelLockUntil": "2026-10-09T00:00:00.000Z",
-        "providerSpecificData": {"cookie": "STALE", "connectionProxyEnabled": False},
+        # account-level: must survive a token change
+        "lastUsedAt": "2026-10-01T00:00:00.000Z",
+        # credential-health: describes OLDTOKEN, must be dropped when it changes
+        "consecutiveUseCount": 2, "lastError": {"status": 429}, "errorCode": 429,
+        "modelLock_gpt-5.6-luna": "2026-10-09T00:00:00.000Z",
+        "modelLock___all": "2026-10-09T00:00:00.000Z",
+        # every key resolveConolCredentials ranks above apiKey
+        "cookie": "TOP_LEVEL_SHADOW",
+        "providerSpecificData": {
+            "cookie": "PSD_SHADOW",
+            "sessionToken": "SESSION_SHADOW",
+            "connectionProxyEnabled": False,
+            "connectionProxyUrl": "http://proxy.local:8080",
+        },
     })
     conn.execute(
         "INSERT INTO providerConnections VALUES(?, 'conol-web', 'cookie', ?, ?, NULL, 1, ?, ?, ?)",
         ("merge-id", "mergeacct", "merge@example.com", seed, dt_now(), dt_now()),
     )
-    upsert_provider_connection(
-        conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
-        "NEWTOKEN", time.time() + 600, time.time(),
-    )
+    upsert_provider_connection(conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
+                               "NEWTOKEN", time.time() + 600, time.time())
     conn.commit()
     after = json.loads(conn.execute(
-        "SELECT data FROM providerConnections WHERE email='merge@example.com'"
-    ).fetchone()[0])
+        "SELECT data FROM providerConnections WHERE email='merge@example.com'").fetchone()[0])
+    psd = after["providerSpecificData"]
     assert after["apiKey"] == "NEWTOKEN", f"token not imported: {after['apiKey']}"
-    assert "cookie" not in after["providerSpecificData"], "stale cookie would shadow apiKey"
-    assert after["providerSpecificData"].get("connectionProxyEnabled") is False, "proxy config lost"
-    assert after["lastUsedAt"] == "2026-10-01T00:00:00.000Z", "LRU history reset by re-import"
-    assert after["consecutiveUseCount"] == 2, "sticky counter reset by re-import"
-    assert after["modelLockUntil"] == "2026-10-09T00:00:00.000Z", "health lock cleared by re-import"
+    for shadow in ("cookie",):
+        assert shadow not in after, f"top-level {shadow} would shadow apiKey"
+    for shadow in ("cookie", COOKIE_NAME, "sessionToken"):
+        assert shadow not in psd, f"providerSpecificData.{shadow} would shadow apiKey"
+    assert psd.get("connectionProxyEnabled") is False, "proxy config lost"
+    assert psd.get("connectionProxyUrl") == "http://proxy.local:8080", "proxy url lost"
+    assert after["lastUsedAt"] == "2026-10-01T00:00:00.000Z", "account-level LRU history lost"
+    for gone in ("consecutiveUseCount", "lastError", "errorCode",
+                 "modelLock_gpt-5.6-luna", "modelLock___all"):
+        assert gone not in after, f"{gone} describes the dead token and must be cleared"
     assert after["testStatus"] == "unknown", "verdict for a replaced token must reset"
-    # Same token again → verdict preserved this time.
-    merged_row = dict(after, testStatus="active")
+    print("[PASS] token change: credential merged, shadows dropped, account config kept, "
+          "dead-token health state cleared")
+
+    # 5. Same token again → nothing about health may be touched (a legitimate
+    #    rate-limit lock must not be lifted by an idempotent re-import).
+    reseed = dict(after, testStatus="active", consecutiveUseCount=3,
+                  modelLock___all="2026-10-09T00:00:00.000Z")
     conn.execute("UPDATE providerConnections SET data=? WHERE email='merge@example.com'",
-                 (json.dumps(merged_row),))
-    upsert_provider_connection(
-        conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
-        "NEWTOKEN", time.time() + 600, time.time(),
-    )
+                 (json.dumps(reseed),))
+    upsert_provider_connection(conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
+                               "NEWTOKEN", time.time() + 600, time.time())
     conn.commit()
     kept = json.loads(conn.execute(
-        "SELECT data FROM providerConnections WHERE email='merge@example.com'"
-    ).fetchone()[0])
+        "SELECT data FROM providerConnections WHERE email='merge@example.com'").fetchone()[0])
     assert kept["testStatus"] == "active", "idempotent re-run must not wipe a live verdict"
-    print("[PASS] re-import merges: runtime state kept, stale cookie dropped, verdict reset only on token change")
+    assert kept["consecutiveUseCount"] == 3, "idempotent re-run must not reset sticky state"
+    assert kept["modelLock___all"] == "2026-10-09T00:00:00.000Z", \
+        "idempotent re-run must not lift a legitimate lock"
+    print("[PASS] unchanged token: verdict, sticky counter and locks preserved")
 
     conn.close()
     _os.remove(tmp)
