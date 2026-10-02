@@ -62,20 +62,32 @@ def read_pool(path):
     """Read JSONL pool, return list of dicts with fixed cookie paths."""
     pool_dir = os.path.dirname(path)
     entries = []
-    with open(path) as f:
+    skipped = 0
+    with open(path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
             if not line:
                 continue
-            entry = json.loads(line)
-            # Fix cookie path if broken (points to wrong dir)
+            try:
+                entry = json.loads(line)
+            except json.JSONDecodeError:
+                # A live registrar appends to this file, so a sync can land
+                # mid-write. Skip the torn trailing line instead of failing the
+                # whole import — the next run picks that account up.
+                skipped += 1
+                continue
+            if not isinstance(entry, dict) or not entry.get("email"):
+                skipped += 1
+                continue
+            # Fix cookie path if broken (points to a pre-move directory)
             cp = entry.get("cookies_path", "")
             if cp and not os.path.exists(cp):
-                # Try same dir as pool file
                 alt = os.path.join(pool_dir, os.path.basename(cp))
                 if os.path.exists(alt):
                     entry["cookies_path"] = alt
             entries.append(entry)
+    if skipped:
+        print(f"  ! skipped {skipped} unparsable/incomplete pool line(s)", file=sys.stderr)
     return entries
 
 
