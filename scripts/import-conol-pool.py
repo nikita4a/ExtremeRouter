@@ -301,21 +301,17 @@ def print_report(report, prefix=""):
 
 
 def selfcheck():
-    """Runnable self-check: cookie normalization + dedup + isActive logic."""
-    ok = True
+    """Runnable checks against the SHIPPED upsert path. Three checks, no more.
 
-    # 1. normalizeConolCookie equivalent logic: token without "=" → gets prefix
-    token = "abc123def456"
-    expected = "__Secure-better-auth.session_token=abc123def456"
-    result = token if "=" in token else f"{COOKIE_NAME}={token}"
-    assert result == expected, f"normalize fail: {result} != {expected}"
-    print("[PASS] normalizeConolCookie wraps bare token")
-
-    # 2. Already wrapped token with "=" → returned as-is
-    token2 = "__Secure-better-auth.session_token=wrapped"
-    result2 = token2 if "=" in token2 else f"{COOKIE_NAME}={token2}"
-    assert result2 == token2, f"normalize fail (wrapped): {result2} != {token2}"
-    print("[PASS] normalizeConolCookie passes through already-wrapped value")
+    Cookie normalisation is deliberately NOT tested here: `normalizeConolCookie`
+    lives in open-sse/services/conolAuth.js, so a Python re-implementation of it can
+    only fail on a typo in the expectation string — it passes forever regardless of
+    what ER actually does, which is worse than no test because it reads as coverage.
+    That behaviour is covered by scripts/check-conol-cred.mjs, which imports the
+    production module and resolves a real database row through it. Two such
+    tautological checks (and an earlier private `_upsert` stub) were removed here
+    after being cited as "selfcheck 5/5 PASS".
+    """
 
     # 3. Dedup + isActive, driven through the REAL upsert_provider_connection.
     #    A private re-implementation would prove nothing about the shipped code —
@@ -408,7 +404,8 @@ def selfcheck():
 
     conn.close()
     _os.remove(tmp)
-    print("[PASS] All self-checks passed")
+    print("[PASS] 3/3 self-checks: dedup+isActive, merge with health-state clearing, "
+          "unchanged-token preservation")
 
 
 if __name__ == "__main__":
