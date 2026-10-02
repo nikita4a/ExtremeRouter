@@ -15,33 +15,48 @@ from datetime import datetime, timezone
 
 NOW = time.time()
 COOKIE_NAME = "__Secure-better-auth.session_token"
-DEFAULT_POOL = os.path.join(
-    os.path.expanduser("~"), "Desktop", "_PROJECTS",
-    "conol_autoreg", "conol_accounts_pool.jsonl"
+_HOME_CANDIDATES = [
+    os.environ.get("USERPROFILE"),
+    os.path.expanduser("~"),
+    r"C:\Users\User",
+    # script is at <root>/tmp/er-fork/ExtremeRouter/scripts/ -> walk up to the user home
+    os.path.dirname(os.path.dirname(os.path.dirname(os.path.dirname(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))))))),
+]
+_HOME_CANDIDATES = [h for h in _HOME_CANDIDATES if h]
+
+
+def _first_existing(rel_parts):
+    """Resolve a path under the user home, tolerating a broken expanduser('~')."""
+    for home in _HOME_CANDIDATES:
+        candidate = os.path.abspath(os.path.join(home, *rel_parts))
+        if os.path.exists(candidate):
+            return candidate
+    return os.path.abspath(os.path.join(_HOME_CANDIDATES[0], *rel_parts))
+
+
+DEFAULT_POOL = _first_existing(
+    ("Desktop", "_PROJECTS", "conol_autoreg", "conol_accounts_pool.jsonl")
 )
-DEFAULT_DB = os.path.join(
-    os.environ.get("APPDATA", os.path.join(os.path.expanduser("~"), "AppData", "Roaming")),
-    "extremerouter", "db", "data.sqlite"
+DEFAULT_DB = _first_existing(
+    ("AppData", "Roaming", "extremerouter", "db", "data.sqlite")
 )
 
 
 def resolve_pool_path(pool_arg):
     if pool_arg:
         return os.path.abspath(pool_arg)
-    # default: relative to script
-    candidate = os.path.abspath(DEFAULT_POOL)
-    if os.path.exists(candidate):
-        return candidate
-    raise FileNotFoundError(f"Pool file not found at {candidate}")
+    if os.path.exists(DEFAULT_POOL):
+        return DEFAULT_POOL
+    raise FileNotFoundError(f"Pool file not found at {DEFAULT_POOL}; pass --pool")
 
 
 def resolve_db_path(db_arg):
     if db_arg:
         return os.path.abspath(db_arg)
-    candidate = os.path.abspath(DEFAULT_DB)
-    if os.path.exists(candidate):
-        return candidate
-    raise FileNotFoundError(f"DB not found at {candidate}")
+    if os.path.exists(DEFAULT_DB):
+        return DEFAULT_DB
+    raise FileNotFoundError(f"DB not found at {DEFAULT_DB}; pass --db")
 
 
 def read_pool(path):
