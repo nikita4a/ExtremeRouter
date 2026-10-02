@@ -240,6 +240,53 @@ def dt_now():
     return now.strftime("%Y-%m-%dT%H:%M:%S.") + f"{now.microsecond:06d}Z"
 
 
+ROTATION_PROVIDER = "conol-web"
+ROTATION_STRATEGY = "round-robin"
+
+
+def ensure_rotation_setting(conn):
+    """Keep conol-web on round-robin, repairing it if a dashboard save dropped it.
+
+    settings(id=1) is one JSON blob. updateSettings() merges providerStrategies only
+    one level deep (NESTED_SETTING_KEYS), so saving some OTHER field of the conol-web
+    entry replaces the whole entry and silently drops fallbackStrategy — the pool
+    reverts to fill-first, one account burns its 100 daily credits while the rest
+    idle, and nothing logs it. The importer already runs on the mandatory sub-7-day
+    maintenance cadence, so this is the cheapest place to detect and repair it.
+    """
+    row = conn.execute("SELECT data FROM settings WHERE id = 1").fetchone()
+    try:
+        data = json.loads(row[0]) if row and row[0] else {}
+    except (json.JSONDecodeError, TypeError):
+        print("  ! settings(id=1) is not valid JSON — leaving it untouched", file=sys.stderr)
+        return
+    if not isinstance(data, dict):
+        print("  ! settings(id=1) is not an object — leaving it untouched", file=sys.stderr)
+        return
+
+    strategies = data.get("providerStrategies")
+    if not isinstance(strategies, dict):
+        strategies = {}
+    entry = strategies.get(ROTATION_PROVIDER)
+    if not isinstance(entry, dict):
+        entry = {}
+
+    if entry.get("fallbackStrategy") == ROTATION_STRATEGY:
+        print(f"  rotation: {ROTATION_PROVIDER} already {ROTATION_STRATEGY}")
+        return
+
+    print(f"  rotation: {ROTATION_PROVIDER}.fallbackStrategy was "
+          f"{entry.get('fallbackStrategy')!r} — restoring {ROTATION_STRATEGY}")
+    entry["fallbackStrategy"] = ROTATION_STRATEGY
+    strategies[ROTATION_PROVIDER] = entry
+    data["providerStrategies"] = strategies
+    blob = json.dumps(data, ensure_ascii=False)
+    if row:
+        conn.execute("UPDATE settings SET data = ? WHERE id = 1", (blob,))
+    else:
+        conn.execute("INSERT INTO settings(id, data) VALUES(1, ?)", (blob,))
+
+
 def import_pool(pool_path, db_path, dry_run=False, only_live=False):
     """Main import routine. Returns report dict."""
     entries = read_pool(pool_path)
@@ -285,6 +332,7 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False):
             report["errors"].append({"email": entry["email"], "error": str(e)})
 
     if conn:
+        ensure_rotation_setting(conn)
         conn.commit()
         conn.close()
 
