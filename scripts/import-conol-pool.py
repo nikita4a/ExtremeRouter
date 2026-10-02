@@ -86,7 +86,7 @@ def extract_session_token(cookies_path):
     try:
         with open(cookies_path, encoding="utf-8") as f:
             cookies = json.load(f)
-    except (json.JSONDecodeError, OSError) as exc:
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
         # Narrow on purpose: an unreadable cookie file must not masquerade as an
         # expired token (which would silently import the row with isActive=0).
         print(f"  ! cannot read cookies {cookies_path}: {exc}", file=sys.stderr)
@@ -144,13 +144,18 @@ def upsert_provider_connection(cursor, entry, session_token, expires, now_ts):
     ).fetchone()
 
     # The cookie credential is stored in `apiKey`, deliberately NOT in
-    # `providerSpecificData.cookie`:
-    #   - resolveConolCredentials() reads providerSpecificData.cookie BEFORE apiKey, so
-    #     a value there would win forever;
-    #   - runtime auto-refresh (open-sse/handlers/chatCore.js) persists a renewed cookie
-    #     via updateProviderConnection(connId, { apiKey: result.refreshedCookie }).
-    # Storing under providerSpecificData.cookie would shadow every refresh with the
-    # stale token: refresh logs success, requests keep sending the dead cookie.
+    # `providerSpecificData.cookie`, because of RESOLUTION PRECEDENCE:
+    # resolveConolCredentials() reads providerSpecificData.cookie BEFORE
+    # credentials.apiKey, so anything written to apiKey later would be shadowed
+    # by a stale value in providerSpecificData.
+    #
+    # Note (corrects this file's earlier rationale): open-sse/executors/conol-web.js
+    # implements NO refreshedCookie / refreshCredentials, so chatCore.js's
+    # auto-refresh branch never fires for this provider — ER does not renew conol
+    # cookies. Tokens die 7 days after issue (Max-Age=604800); on expiry the
+    # executor 401s, markAccountUnavailable parks the connection, and it stays
+    # parked until an external refresh (conol_refresh.py) plus a re-run of this
+    # importer. Schedule that pair at an interval safely under 7 days.
     payload = {
         "apiKey": session_token or "",
         "baseUrl": "https://conol.ai",
