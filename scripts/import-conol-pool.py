@@ -142,11 +142,45 @@ def get_connection(db_path, retries=3, delay=0.5):
             raise
 
 
-def upsert_provider_connection(cursor, entry, session_token, expires, now_ts):
-    """Upsert one conol-web connection row. Returns dict with status."""
+def load_audit(path):
+    """Load per-account liveness verdicts from conol_audit_live.py's report.
+
+    `isActive` derived from a cookie file's `expires` is NOT liveness: save_cookies
+    fabricates `expires = now + 7 days`, so a token that never authenticated — or
+    died early — still looks valid. Measured gap on 2026-10-03: the importer counted
+    61 active rows while GET /api/auth/get-session confirmed only 50, i.e. 11 rows
+    ER would route to and fail on. Pass --audit to mark isActive from the oracle.
+    """
+    if not path:
+        return {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
+        print(f"  ! cannot read audit {path}: {exc}", file=sys.stderr)
+        return {}
+    verdicts = {}
+    for item in data.get("details", []):
+        email = item.get("email")
+        if email:
+            verdicts[email] = item.get("state")
+    print(f"  audit: {len(verdicts)} verdicts from {os.path.basename(path)} "
+          f"({data.get('audited_at', 'undated')})")
+    return verdicts
+
+
+def upsert_provider_connection(cursor, entry, session_token, expires, now_ts, live_override=None):
+    """Upsert one conol-web connection row. Returns dict with status.
+
+    live_override is this account's verdict from conol_audit_live.py. When present it
+    wins over the cookie-expiry heuristic, which only proves a file was written.
+    """
     email = entry["email"]
     name = entry.get("name", email.split("@")[0])
-    is_live = bool(session_token and expires > now_ts)
+    if live_override is not None:
+        is_live = live_override == "live"
+    else:
+        is_live = bool(session_token and expires > now_ts)
 
     # Check existing by email (dedup)
     existing = cursor.execute(
@@ -287,9 +321,10 @@ def ensure_rotation_setting(conn):
         conn.execute("INSERT INTO settings(id, data) VALUES(1, ?)", (blob,))
 
 
-def import_pool(pool_path, db_path, dry_run=False, only_live=False):
+def import_pool(pool_path, db_path, dry_run=False, only_live=False, audit=None):
     """Main import routine. Returns report dict."""
     entries = read_pool(pool_path)
+    audit = audit or {}
     report = {"total": len(entries), "created": 0, "updated": 0, "skipped": 0, "live": 0, "expired": 0, "no_token": 0, "errors": []}
 
     conn = None
@@ -301,13 +336,14 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False):
 
     for entry in entries:
         token, expires = extract_session_token(entry.get("cookies_path", ""))
+        verdict = audit.get(entry.get("email"))
+        is_live = (verdict == "live") if verdict is not None else bool(token and expires > now_ts)
 
-        if only_live and not (token and expires > now_ts):
+        if only_live and not is_live:
             report["skipped"] += 1
             continue
 
         if dry_run:
-            is_live = bool(token and expires > now_ts)
             if is_live:
                 report["live"] += 1
             elif token:
@@ -317,7 +353,8 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False):
             continue
 
         try:
-            result = upsert_provider_connection(cursor, entry, token, expires, now_ts)
+            result = upsert_provider_connection(cursor, entry, token, expires, now_ts,
+                                                live_override=verdict)
             if result["action"] == "created":
                 report["created"] += 1
             else:
@@ -462,6 +499,7 @@ if __name__ == "__main__":
     parser.add_argument("--db", help="Path to data.sqlite (default: ER user data DB)")
     parser.add_argument("--pool", help="Path to conol_accounts_pool.jsonl (default: canonical)")
     parser.add_argument("--only-live", action="store_true", help="Only import accounts with valid session tokens")
+    parser.add_argument("--audit", help="conol_audit_live.json — mark isActive from real get-session verdicts instead of cookie expiry")
     parser.add_argument("--selfcheck", action="store_true", help="Run unit self-checks and exit")
     args = parser.parse_args()
 
@@ -480,6 +518,7 @@ if __name__ == "__main__":
         bak = backup_db(db_path)
         print(f"Backup: {bak}")
 
-    report = import_pool(pool_path, db_path, dry_run=args.dry_run, only_live=args.only_live)
+    report = import_pool(pool_path, db_path, dry_run=args.dry_run, only_live=args.only_live,
+                         audit=load_audit(args.audit))
     print()
     print_report(report)
