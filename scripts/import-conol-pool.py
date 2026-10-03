@@ -145,11 +145,16 @@ def get_connection(db_path, retries=3, delay=0.5):
 def load_audit(path):
     """Load per-account liveness verdicts from conol_audit_live.py's report.
 
-    `isActive` derived from a cookie file's `expires` is NOT liveness: save_cookies
-    fabricates `expires = now + 7 days`, so a token that never authenticated — or
-    died early — still looks valid. Measured gap on 2026-10-03: the importer counted
-    61 active rows while GET /api/auth/get-session confirmed only 50, i.e. 11 rows
-    ER would route to and fail on. Pass --audit to mark isActive from the oracle.
+    Two rules, both paid for in production:
+
+    1. `isActive` derived from a cookie file's `expires` is NOT liveness —
+       save_cookies fabricates `expires = now + 7 days`, so a token that never
+       authenticated still looks valid. Pass --audit to mark isActive from the oracle.
+    2. Only DECISIVE verdicts may move isActive. A 429/403/5xx means conol refused to
+       answer, which is the auditor's own traffic and not the account's state;
+       honouring such verdicts deactivated 11 working accounts on 2026-10-03.
+       Inconclusive rows are dropped here so they keep the expiry heuristic — and
+       "dead" only counts when conol actually answered 200 with no user.
     """
     if not path:
         return {}
@@ -159,28 +164,43 @@ def load_audit(path):
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         print(f"  ! cannot read audit {path}: {exc}", file=sys.stderr)
         return {}
-    verdicts = {}
+    verdicts, inconclusive = {}, 0
     for item in data.get("details", []):
         email = item.get("email")
-        if email:
-            verdicts[email] = item.get("state")
-    print(f"  audit: {len(verdicts)} verdicts from {os.path.basename(path)} "
-          f"({data.get('audited_at', 'undated')})")
+        if not email:
+            continue
+        state = item.get("state")
+        if state == "live":
+            verdicts[email] = "live"
+        elif state in ("dead", "no_token", "email_mismatch"):
+            # Dead credential, no credential, or a row holding somebody else's
+            # credential: never route to it.
+            verdicts[email] = "dead"
+        else:
+            # rate_limited / network_error: conol never answered, so the verdict says
+            # nothing about the account. "keep" leaves the stored isActive untouched —
+            # neither parking a working account (the 2026-10-03 incident: 14 rows were
+            # deactivated off HTTP 429) nor resurrecting one ER parked for cause via
+            # markAccountUnavailable, which the expiry heuristic would happily do.
+            verdicts[email] = "keep"
+            inconclusive += 1
+    decisive = sum(1 for v in verdicts.values() if v != "keep")
+    print(f"  audit: {decisive} decisive + {inconclusive} inconclusive verdicts from "
+          f"{os.path.basename(path)} ({data.get('audited_at', 'undated')})")
     return verdicts
 
 
 def upsert_provider_connection(cursor, entry, session_token, expires, now_ts, live_override=None):
     """Upsert one conol-web connection row. Returns dict with status.
 
-    live_override is this account's verdict from conol_audit_live.py. When present it
-    wins over the cookie-expiry heuristic, which only proves a file was written.
+    live_override is this account's verdict from conol_audit_live.py: "live", "dead",
+    "keep" (inconclusive — preserve what ER already stores) or None (no audit supplied,
+    fall back to the cookie-expiry heuristic). A decisive verdict wins over the
+    heuristic, which only proves a cookie file was written.
     """
     email = entry["email"]
     name = entry.get("name", email.split("@")[0])
-    if live_override is not None:
-        is_live = live_override == "live"
-    else:
-        is_live = bool(session_token and expires > now_ts)
+    # is_live is decided AFTER the dedup lookup, because "keep" needs the stored value.
 
     # Check existing by email (dedup)
     existing = cursor.execute(
@@ -188,6 +208,13 @@ def upsert_provider_connection(cursor, entry, session_token, expires, now_ts, li
         "WHERE provider='conol-web' AND email=?",
         (email,)
     ).fetchone()
+    heuristic_live = bool(session_token and expires > now_ts)
+    if live_override == "keep":
+        is_live = bool(existing[2]) if existing else heuristic_live
+    elif live_override is not None:
+        is_live = live_override == "live"
+    else:
+        is_live = heuristic_live
 
     # The cookie credential is stored in `apiKey`, deliberately NOT in
     # `providerSpecificData.cookie`, because of RESOLUTION PRECEDENCE:
