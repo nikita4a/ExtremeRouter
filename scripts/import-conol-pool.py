@@ -369,7 +369,14 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False, audit=None):
             report["errors"].append({"email": entry["email"], "error": str(e)})
 
     if conn:
-        ensure_rotation_setting(conn)
+        # Cosmetic setting repair must never roll back the account import: a missing or
+        # locked settings table would otherwise abort before conn.commit() and lose every
+        # row just written. Log and move on — rotation can be re-applied on the next run.
+        try:
+            ensure_rotation_setting(conn)
+        except sqlite3.Error as exc:
+            print(f"  ! rotation setting not applied ({exc}); account rows still committed",
+                  file=sys.stderr)
         conn.commit()
         conn.close()
 
