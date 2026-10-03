@@ -189,7 +189,7 @@ def load_audit(path):
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
-        print(f"  ! cannot read audit {path}: {exc}", file=sys.stderr)
+        print(f"  ! cannot read audit {path}: {exc} — fix the audit file before re-running", file=sys.stderr)
         return _KeepAllVerdicts()
     audited_at = data.get("audited_at") or ""
     try:
@@ -199,8 +199,8 @@ def load_audit(path):
         age_hours = float("inf")
     if age_hours > AUDIT_MAX_AGE_HOURS:
         print(f"  ! audit report is {audited_at or 'undated'} ({age_hours:.1f} h old, limit "
-              f"{AUDIT_MAX_AGE_HOURS} h) — ignoring it; every row KEEPS its stored "
-              f"isActive rather than falling back to the fabricated cookie expiry",
+              f"{AUDIT_MAX_AGE_HOURS} h) — re-run conol_audit_live.py for a fresh report; "
+              f"every row KEEPS its stored isActive instead",
               file=sys.stderr)
         return _KeepAllVerdicts()
     verdicts, inconclusive = {}, 0
@@ -480,7 +480,7 @@ def print_report(report, prefix=""):
 
 
 def selfcheck():
-    """Runnable checks against the SHIPPED upsert path. Four checks, no more.
+    """Runnable checks against the SHIPPED upsert path. Five checks, no more.
 
     Cookie normalisation is deliberately NOT tested here: `normalizeConolCookie`
     lives in open-sse/services/conolAuth.js, so a Python re-implementation of it can
@@ -498,6 +498,7 @@ def selfcheck():
     #    the credential placement changed underneath it.
     import tempfile
     import os as _os
+    _passed = 0
     tmp = _os.path.join(tempfile.gettempdir(), f"conol_selfcheck_{int(time.time())}.db")
     conn = sqlite3.connect(tmp)
     conn.execute("PRAGMA journal_mode=WAL;")
@@ -519,6 +520,7 @@ def selfcheck():
         "SELECT isActive FROM providerConnections WHERE email='test@example.com'").fetchone()[0]
     assert is_a == 0, f"an expired token must set isActive=0, got {is_a}"
     print("[PASS] dedup + isActive via the real upsert_provider_connection")
+    _passed += 1
 
     # 4. Re-import must MERGE, and must clear health state that described a dead token.
     conn.execute("DELETE FROM providerConnections")
@@ -563,6 +565,7 @@ def selfcheck():
     assert after["testStatus"] == "unknown", "verdict for a replaced token must reset"
     print("[PASS] token change: credential merged, shadows dropped, account config kept, "
           "dead-token health state cleared")
+    _passed += 1
 
     # 5. Same token again → nothing about health may be touched (a legitimate
     #    rate-limit lock must not be lifted by an idempotent re-import).
@@ -579,6 +582,7 @@ def selfcheck():
     assert kept["consecutiveUseCount"] == 3, "idempotent re-run must not reset sticky state"
     assert kept["modelLock___all"] == "2026-10-09T00:00:00.000Z", \
         "idempotent re-run must not lift a legitimate lock"
+    _passed += 1
 
     # 6. An inconclusive verdict ("keep") must preserve the stored isActive. This is the
     #    silent-failure branch: it reads existing[2] positionally, and if that index ever
@@ -603,11 +607,82 @@ def selfcheck():
     print("[PASS] keep preserves stored isActive in both directions "
           "(no resurrection, no parking)")
     print("[PASS] unchanged token: verdict, sticky counter and locks preserved")
+    _passed += 1
 
     conn.close()
     _os.remove(tmp)
-    print("[PASS] 4/4 self-checks: dedup+isActive, merge with health-state clearing, "
-          "unchanged-token preservation, keep-is-neutral")
+
+    # 7. _KeepAllVerdicts marker through the REAL import_pool. The #6 block proves
+    #    upsert_provider_connection handles "keep" in isolation, but the full code path
+    #    (import_pool → read_pool → extract_session_token → upsert) has a second guard:
+    #    `audit = {} if audit is None else audit`. If that ever becomes `audit = audit or
+    #    {}`, a _KeepAllVerdicts() (empty dict → falsy) collapses and every row falls
+    #    through to the cookie-expiry heuristic. This block exercises the real function.
+    tmpdir = _os.path.join(tempfile.gettempdir(), f"conol_selfcheck{int(time.time())}")
+    _os.mkdir(tmpdir)
+    _pool_p = _os.path.join(tmpdir, "pool.jsonl")
+    _db_p = _os.path.join(tmpdir, "pool.db")
+    _stale_p = _os.path.join(tmpdir, "stale.json")
+    _fresh_p = _os.path.join(tmpdir, "fresh.json")
+    with open(_pool_p, "w") as _f:
+        _f.write(json.dumps({"email": "keepall-test@example.com", "name": "keepalltst",
+                             "cookies_path": ""}) + "\n")
+    _c7 = sqlite3.connect(_db_p)
+    _c7.execute("PRAGMA journal_mode=WAL;")
+    _c7.execute("""CREATE TABLE providerConnections (
+        id TEXT PRIMARY KEY, provider TEXT NOT NULL, authType TEXT NOT NULL,
+        name TEXT, email TEXT, priority INTEGER, isActive INTEGER DEFAULT 1,
+        data TEXT NOT NULL, createdAt TEXT NOT NULL, updatedAt TEXT NOT NULL
+    );""")
+    import uuid
+    _d7 = json.dumps({"apiKey": "", "baseUrl": "https://conol.ai", "providerSpecificData": {}})
+    _n7 = dt_now()
+    _c7.execute(
+        "INSERT INTO providerConnections VALUES(?, 'conol-web', 'cookie', ?, ?, NULL, ?, ?, ?, ?)",
+        (str(uuid.uuid4()), "keepalltst", "keepall-test@example.com", 1, _d7, _n7, _n7),
+    )
+    _c7.commit()
+    _c7.close()
+
+    # Stale audit: >6h old → _KeepAllVerdicts. The stale path returns the marker only
+    # when audited_at is absent OR the age > AUDIT_MAX_AGE_HOURS. Setting audited_at to
+    # a date before that threshold triggers the stale path.
+    with open(_stale_p, "w") as _f:
+        json.dump({"audited_at": "2026-10-01 00:00:00", "details": []}, _f)
+    import_pool(_pool_p, _db_p, audit=load_audit(_stale_p))
+    _c7a = sqlite3.connect(_db_p)
+    _kept = _c7a.execute(
+        "SELECT isActive FROM providerConnections WHERE email='keepall-test@example.com'"
+    ).fetchone()[0]
+    assert _kept == 1, f"stale audit must preserve isActive=1, got {_kept}"
+    _c7a.close()
+
+    # Control: fresh audit with dead verdic → must set isActive=0. Without this, the
+    # test could pass simply because import_pool silently does nothing (e.g. if the
+    # pool path resolves differently or the DB is read-only) and the stale path also
+    # "preserves" — because nothing was written at all.
+    now_str = __import__("datetime").datetime.now(
+        __import__("datetime").timezone.utc).strftime("%Y-%m-%d %H:%M:%S")
+    with open(_fresh_p, "w") as _f:
+        json.dump({"audited_at": now_str,
+                    "details": [{"email": "keepall-test@example.com", "state": "dead"}]}, _f)
+    import_pool(_pool_p, _db_p, audit=load_audit(_fresh_p))
+    _c7b = sqlite3.connect(_db_p)
+    _dead = _c7b.execute(
+        "SELECT isActive FROM providerConnections WHERE email='keepall-test@example.com'"
+    ).fetchone()[0]
+    assert _dead == 0, f"fresh dead audit must set isActive=0, got {_dead}"
+    _c7b.close()
+
+    import shutil
+    shutil.rmtree(tmpdir)
+    print("[PASS] _KeepAllVerdicts through real import_pool: stale audit preserves stored "
+          "isActive, fresh dead audit deactivates")
+    _passed += 1
+
+    print(f"[PASS] {_passed}/{_passed} self-checks: dedup+isActive, merge with health-state "
+          f"clearing, unchanged-token preservation, keep-is-neutral, "
+          f"keep-all through import_pool")
 
 
 if __name__ == "__main__":
