@@ -142,19 +142,31 @@ def get_connection(db_path, retries=3, delay=0.5):
             raise
 
 
+# An audit older than this is refused outright. A stale report predating a token
+# refresh would deactivate accounts that have since been renewed, and reports written
+# before the 429 fix stored rate-limited rows as `dead` with a hardcoded `http: 200` —
+# indistinguishable from real death, so no verdict filter can launder them.
+AUDIT_MAX_AGE_HOURS = 6
+
 def load_audit(path):
     """Load per-account liveness verdicts from conol_audit_live.py's report.
 
-    Two rules, both paid for in production:
+    Returns {email: "live" | "dead" | "keep"}.
 
-    1. `isActive` derived from a cookie file's `expires` is NOT liveness —
+    Two rules, both paid for in production on 2026-10-03:
+
+    1. `isActive` derived from a cookie file's `expires` is not liveness —
        save_cookies fabricates `expires = now + 7 days`, so a token that never
-       authenticated still looks valid. Pass --audit to mark isActive from the oracle.
-    2. Only DECISIVE verdicts may move isActive. A 429/403/5xx means conol refused to
-       answer, which is the auditor's own traffic and not the account's state;
-       honouring such verdicts deactivated 11 working accounts on 2026-10-03.
-       Inconclusive rows are dropped here so they keep the expiry heuristic — and
-       "dead" only counts when conol actually answered 200 with no user.
+       authenticated still looks valid. --audit replaces that guess with the oracle.
+    2. Only DECISIVE verdicts may move isActive. conol answers 429 when the auditor
+       outruns it, and a 429 says nothing about the account: an audit run with
+       --workers 4 over 68 rows recorded 14 working accounts as dead, and importing
+       those verdicts parked them in ER. Inconclusive rows map to "keep", which leaves
+       the stored isActive untouched — neither parking a working account nor
+       resurrecting one ER parked for cause via markAccountUnavailable.
+
+    "dead" covers the oracle's real death signals (200 with no user, explicit 401)
+    plus `no_token` and `email_mismatch`, where routing would be wrong regardless.
     """
     if not path:
         return {}
@@ -163,6 +175,17 @@ def load_audit(path):
             data = json.load(f)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         print(f"  ! cannot read audit {path}: {exc}", file=sys.stderr)
+        return {}
+    audited_at = data.get("audited_at") or ""
+    try:
+        stamp = time.mktime(time.strptime(audited_at, "%Y-%m-%d %H:%M:%S"))
+        age_hours = (time.time() - stamp) / 3600.0
+    except (ValueError, TypeError):
+        age_hours = float("inf")
+    if age_hours > AUDIT_MAX_AGE_HOURS:
+        print(f"  ! audit report is {audited_at or 'undated'} ({age_hours:.1f} h old, limit "
+              f"{AUDIT_MAX_AGE_HOURS} h) — ignoring it; isActive stays on the expiry "
+              f"heuristic rather than trusting stale verdicts", file=sys.stderr)
         return {}
     verdicts, inconclusive = {}, 0
     for item in data.get("details", []):
@@ -352,7 +375,8 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False, audit=None):
     """Main import routine. Returns report dict."""
     entries = read_pool(pool_path)
     audit = audit or {}
-    report = {"total": len(entries), "created": 0, "updated": 0, "skipped": 0, "live": 0, "expired": 0, "no_token": 0, "errors": []}
+    report = {"total": len(entries), "created": 0, "updated": 0, "skipped": 0, "live": 0,
+              "expired": 0, "no_token": 0, "kept": 0, "errors": []}
 
     conn = None
     if not dry_run:
@@ -364,14 +388,26 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False, audit=None):
     for entry in entries:
         token, expires = extract_session_token(entry.get("cookies_path", ""))
         verdict = audit.get(entry.get("email"))
-        is_live = (verdict == "live") if verdict is not None else bool(token and expires > now_ts)
+        # Tri-state. True/False are decisive; None means the audit could not tell
+        # (rate_limited / network_error), so the stored isActive must survive. Reading
+        # this as a boolean made --only-live skip those rows outright — their token
+        # never reached ER — and --dry-run report them as expired, contradicting the
+        # real run where upsert preserves the previous value.
+        if verdict == "keep":
+            is_live = None
+        elif verdict is not None:
+            is_live = verdict == "live"
+        else:
+            is_live = bool(token and expires > now_ts)
 
-        if only_live and not is_live:
+        if only_live and is_live is False:
             report["skipped"] += 1
             continue
 
         if dry_run:
-            if is_live:
+            if is_live is None:
+                report["kept"] += 1
+            elif is_live:
                 report["live"] += 1
             elif token:
                 report["expired"] += 1
@@ -386,7 +422,11 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False, audit=None):
                 report["created"] += 1
             else:
                 report["updated"] += 1
-            if result["live"]:
+            if verdict == "keep":
+                # Reported separately: "expired" would claim a measurement the audit
+                # explicitly could not make.
+                report["kept"] += 1
+            elif result["live"]:
                 report["live"] += 1
             elif result["token_present"]:
                 report["expired"] += 1
@@ -412,7 +452,8 @@ def import_pool(pool_path, db_path, dry_run=False, only_live=False, audit=None):
 
 def print_report(report, prefix=""):
     print(f"{prefix}Total: {report['total']}, Created: {report['created']}, Updated: {report['updated']}, Skipped: {report['skipped']}")
-    print(f"{prefix}Live: {report['live']}, Expired: {report['expired']}, No Token: {report['no_token']}")
+    print(f"{prefix}Live: {report['live']}, Expired: {report['expired']}, "
+          f"No Token: {report['no_token']}, Kept (audit inconclusive): {report.get('kept', 0)}")
     if report['errors']:
         print(f"{prefix}Errors ({len(report['errors'])}):")
         for e in report['errors']:
@@ -519,12 +560,35 @@ def selfcheck():
     assert kept["consecutiveUseCount"] == 3, "idempotent re-run must not reset sticky state"
     assert kept["modelLock___all"] == "2026-10-09T00:00:00.000Z", \
         "idempotent re-run must not lift a legitimate lock"
+
+    # 4. An inconclusive verdict ("keep") must preserve the stored isActive. This is the
+    #    silent-failure branch: it reads existing[2] positionally, and if that index ever
+    #    drifts onto the JSON blob, bool(<blob>) is always True — every rate-limited
+    #    account would be resurrected with no error anywhere. Both directions are checked.
+    conn.execute("UPDATE providerConnections SET isActive=0 WHERE email='merge@example.com'")
+    upsert_provider_connection(cursor, {"email": "merge@example.com", "name": "mergeacct"},
+                               "OLDTOKEN", time.time() + 604800, time.time(),
+                               live_override="keep")
+    conn.commit()
+    kept_inactive = conn.execute(
+        "SELECT isActive FROM providerConnections WHERE email='merge@example.com'").fetchone()[0]
+    assert kept_inactive == 0, f"keep must preserve isActive=0, got {kept_inactive}"
+    conn.execute("UPDATE providerConnections SET isActive=1 WHERE email='merge@example.com'")
+    upsert_provider_connection(cursor, {"email": "merge@example.com", "name": "mergeacct"},
+                               "OLDTOKEN", 0, time.time(), live_override="keep")
+    conn.commit()
+    kept_active = conn.execute(
+        "SELECT isActive FROM providerConnections WHERE email='merge@example.com'").fetchone()[0]
+    assert kept_active == 1, (
+        f"keep must not deactivate on an expired cookie either, got {kept_active}")
+    print("[PASS] keep preserves stored isActive in both directions "
+          "(no resurrection, no parking)")
     print("[PASS] unchanged token: verdict, sticky counter and locks preserved")
 
     conn.close()
     _os.remove(tmp)
-    print("[PASS] 3/3 self-checks: dedup+isActive, merge with health-state clearing, "
-          "unchanged-token preservation")
+    print("[PASS] 4/4 self-checks: dedup+isActive, merge with health-state clearing, "
+          "unchanged-token preservation, keep-is-neutral")
 
 
 if __name__ == "__main__":
