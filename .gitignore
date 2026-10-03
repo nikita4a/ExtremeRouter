@@ -115,3 +115,7 @@ sea-prep.blob
 
 # capability audit cache
 .cache/
+
+# Python bytecode (scripts/*.py are run and py_compiled in-tree)
+__pycache__/
+*.pyc

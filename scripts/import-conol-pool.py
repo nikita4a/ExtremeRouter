@@ -148,6 +148,21 @@ def get_connection(db_path, retries=3, delay=0.5):
 # indistinguishable from real death, so no verdict filter can launder them.
 AUDIT_MAX_AGE_HOURS = 6
 
+class _KeepAllVerdicts(dict):
+    """Marker: --audit was supplied but the report is unusable (stale or corrupt).
+
+    Returning a plain {} here would mean "no audit supplied", which falls back to the
+    fabricated cookie `expires` — i.e. "the oracle is unavailable" would silently
+    become "trust the synthetic expiry", resurrecting rows ER parked via
+    markAccountUnavailable and rows whose tokens died days ago. Every row keeps its
+    stored isActive instead. Empty on purpose: `get()` is overridden, and callers must
+    not test this object for truthiness.
+    """
+
+    def get(self, key, default=None):  # noqa: D102 - deliberate override
+        return "keep"
+
+
 def load_audit(path):
     """Load per-account liveness verdicts from conol_audit_live.py's report.
 
@@ -175,7 +190,7 @@ def load_audit(path):
             data = json.load(f)
     except (OSError, json.JSONDecodeError, UnicodeDecodeError) as exc:
         print(f"  ! cannot read audit {path}: {exc}", file=sys.stderr)
-        return {}
+        return _KeepAllVerdicts()
     audited_at = data.get("audited_at") or ""
     try:
         stamp = time.mktime(time.strptime(audited_at, "%Y-%m-%d %H:%M:%S"))
@@ -184,9 +199,10 @@ def load_audit(path):
         age_hours = float("inf")
     if age_hours > AUDIT_MAX_AGE_HOURS:
         print(f"  ! audit report is {audited_at or 'undated'} ({age_hours:.1f} h old, limit "
-              f"{AUDIT_MAX_AGE_HOURS} h) — ignoring it; isActive stays on the expiry "
-              f"heuristic rather than trusting stale verdicts", file=sys.stderr)
-        return {}
+              f"{AUDIT_MAX_AGE_HOURS} h) — ignoring it; every row KEEPS its stored "
+              f"isActive rather than falling back to the fabricated cookie expiry",
+              file=sys.stderr)
+        return _KeepAllVerdicts()
     verdicts, inconclusive = {}, 0
     for item in data.get("details", []):
         email = item.get("email")
@@ -374,7 +390,10 @@ def ensure_rotation_setting(conn):
 def import_pool(pool_path, db_path, dry_run=False, only_live=False, audit=None):
     """Main import routine. Returns report dict."""
     entries = read_pool(pool_path)
-    audit = audit or {}
+    # `audit or {}` would collapse an empty _KeepAllVerdicts marker back to "no audit
+    # supplied" and re-enable the expiry heuristic — the exact fallback the marker
+    # exists to prevent. Identity check only.
+    audit = {} if audit is None else audit
     report = {"total": len(entries), "created": 0, "updated": 0, "skipped": 0, "live": 0,
               "expired": 0, "no_token": 0, "kept": 0, "errors": []}
 
@@ -461,7 +480,7 @@ def print_report(report, prefix=""):
 
 
 def selfcheck():
-    """Runnable checks against the SHIPPED upsert path. Three checks, no more.
+    """Runnable checks against the SHIPPED upsert path. Four checks, no more.
 
     Cookie normalisation is deliberately NOT tested here: `normalizeConolCookie`
     lives in open-sse/services/conolAuth.js, so a Python re-implementation of it can
@@ -561,13 +580,13 @@ def selfcheck():
     assert kept["modelLock___all"] == "2026-10-09T00:00:00.000Z", \
         "idempotent re-run must not lift a legitimate lock"
 
-    # 4. An inconclusive verdict ("keep") must preserve the stored isActive. This is the
+    # 6. An inconclusive verdict ("keep") must preserve the stored isActive. This is the
     #    silent-failure branch: it reads existing[2] positionally, and if that index ever
     #    drifts onto the JSON blob, bool(<blob>) is always True — every rate-limited
     #    account would be resurrected with no error anywhere. Both directions are checked.
     conn.execute("UPDATE providerConnections SET isActive=0 WHERE email='merge@example.com'")
     upsert_provider_connection(conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
-                               "OLDTOKEN", time.time() + 604800, time.time(),
+                               "NEWTOKEN", time.time() + 604800, time.time(),
                                live_override="keep")
     conn.commit()
     kept_inactive = conn.execute(
@@ -575,7 +594,7 @@ def selfcheck():
     assert kept_inactive == 0, f"keep must preserve isActive=0, got {kept_inactive}"
     conn.execute("UPDATE providerConnections SET isActive=1 WHERE email='merge@example.com'")
     upsert_provider_connection(conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
-                               "OLDTOKEN", 0, time.time(), live_override="keep")
+                               "NEWTOKEN", 0, time.time(), live_override="keep")
     conn.commit()
     kept_active = conn.execute(
         "SELECT isActive FROM providerConnections WHERE email='merge@example.com'").fetchone()[0]
