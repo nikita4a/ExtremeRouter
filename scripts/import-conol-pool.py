@@ -566,7 +566,7 @@ def selfcheck():
     #    drifts onto the JSON blob, bool(<blob>) is always True — every rate-limited
     #    account would be resurrected with no error anywhere. Both directions are checked.
     conn.execute("UPDATE providerConnections SET isActive=0 WHERE email='merge@example.com'")
-    upsert_provider_connection(cursor, {"email": "merge@example.com", "name": "mergeacct"},
+    upsert_provider_connection(conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
                                "OLDTOKEN", time.time() + 604800, time.time(),
                                live_override="keep")
     conn.commit()
@@ -574,7 +574,7 @@ def selfcheck():
         "SELECT isActive FROM providerConnections WHERE email='merge@example.com'").fetchone()[0]
     assert kept_inactive == 0, f"keep must preserve isActive=0, got {kept_inactive}"
     conn.execute("UPDATE providerConnections SET isActive=1 WHERE email='merge@example.com'")
-    upsert_provider_connection(cursor, {"email": "merge@example.com", "name": "mergeacct"},
+    upsert_provider_connection(conn.cursor(), {"email": "merge@example.com", "name": "mergeacct"},
                                "OLDTOKEN", 0, time.time(), live_override="keep")
     conn.commit()
     kept_active = conn.execute(
