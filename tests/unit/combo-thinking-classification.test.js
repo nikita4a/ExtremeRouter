@@ -20,7 +20,7 @@ describe("combo thinking classification (runtime-truth mapping)", () => {
     // excluded them from the effort option.
     for (const m of [
       member("anthropic", "claude-sonnet-5"),   // claude-adaptive
-      member("anthropic", "claude-opus-5"),     // claude-budget
+      member("anthropic", "claude-opus-5"),     // claude-adaptive
       member("google", "gemini-2.5-pro"),       // gemini-budget
       member("zai", "glm-5.2"),                 // zai
       member("openai", "gpt-5.3"),              // openai

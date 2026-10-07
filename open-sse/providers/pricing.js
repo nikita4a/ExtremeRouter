@@ -960,6 +960,15 @@ export const PATTERN_PRICING = [
   { pattern: "*-codex",         pricing: { input: 3.00,  output: 12.00, cached: 1.50,  reasoning: 18.00,  cache_creation: 3.00  } },
 
   // --- Claude ---
+  // Opus 5.5 is $4/$20 upstream (openrouter.ai/api/v1/models, 2026-10-03) while the
+  // generic claude-opus-* row below bills 5/25 — specific patterns first. The leading
+  // "*" is required because getPricingForModel strips only a slash vendor prefix:
+  // Bedrock-style ids (1min's us.anthropic.claude-opus-5-5) and dash-prefixed ones
+  // never reach the prefix-anchored claude-opus-* and priced as null, which
+  // calculateCostFromTokens then reported as free.
+  { pattern: "*claude-opus-5.5*", pricing: { input: 4.00,  output: 20.00, cached: 0.20,  reasoning: 30.00,  cache_creation: 5.00  } },
+  { pattern: "*claude-opus-5-5*", pricing: { input: 4.00,  output: 20.00, cached: 0.20,  reasoning: 30.00,  cache_creation: 5.00  } },
+  { pattern: "*claude-opus-5*",   pricing: { input: 5.00,  output: 25.00, cached: 0.50,  reasoning: 25.00,  cache_creation: 6.25  } },
   { pattern: "claude-opus-*",   pricing: { input: 5.00,  output: 25.00, cached: 0.50,  reasoning: 25.00,  cache_creation: 6.25  } },
   { pattern: "claude-sonnet-*", pricing: { input: 3.00,  output: 15.00, cached: 0.30,  reasoning: 15.00,  cache_creation: 3.75  } },
   { pattern: "claude-haiku-*",  pricing: { input: 1.00,  output: 5.00,  cached: 0.10,  reasoning: 5.00,   cache_creation: 1.25  } },
@@ -974,6 +983,23 @@ export const PATTERN_PRICING = [
   { pattern: "gemini-*",        pricing: { input: 0.50,  output: 3.00,  cached: 0.03,  reasoning: 4.50,   cache_creation: 0.50  } },
 
   // --- GPT (specific first, generic last) ---
+  // --- GPT-6 family (rates: opencode.ai/docs/zen + openrouter.ai/api/v1/models, 2026-10-03) ---
+  // Leading "*" so vendor-prefixed spellings match too (venice ships
+  // openai-gpt-6-astra / openai-gpt-6-luna; 1min ships gpt-6.1-sol). Without a row
+  // at all these resolved to null and every call on those lanes reported $0 spend.
+  // Bare "gpt-6-astra" still keeps its deliberate MODEL_PRICING parity rate —
+  // exact rows win before patterns. reasoning = 1.5x output, cache_creation = input.
+  // ponytail: GPT-6 is context-tiered upstream — astra $10/$50 at ≤272K but $20/$75
+  // above, sol and 6.1-sol $2/$10 → $4/$15, luna $0.10/$0.50 → $0.20/$0.75. This table
+  // has no tier mechanism (gpt-5.6-sol, claude-sonnet-4.5 and gemini-3.1-pro are already
+  // flattened the same way), so these rows carry the ≤272K tier and longer calls are
+  // estimated ~2x low. Correct it per lane in PROVIDER_PRICING, not by clipping the
+  // *gpt-6* window: the real window is 1 050 000 and 272K would refuse usable context on
+  // openrouter/venice/kilocode/infron/1min.
+  { pattern: "*gpt-6.1-sol*",    pricing: { input: 2.00,  output: 10.00, cached: 0.10,  reasoning: 15.00,  cache_creation: 2.00  } },
+  { pattern: "*gpt-6-sol*",      pricing: { input: 2.00,  output: 10.00, cached: 0.20,  reasoning: 15.00,  cache_creation: 2.00  } },
+  { pattern: "*gpt-6-luna*",     pricing: { input: 0.10,  output: 0.50,  cached: 0.01,  reasoning: 0.75,   cache_creation: 0.10  } },
+  { pattern: "*gpt-6-astra*",    pricing: { input: 10.00, output: 50.00, cached: 1.00,  reasoning: 75.00,  cache_creation: 10.00 } },
   { pattern: "gpt-5.3-*",       pricing: { input: 6.00,  output: 24.00, cached: 3.00,  reasoning: 36.00,  cache_creation: 6.00  } },
   { pattern: "gpt-5.2-*",       pricing: { input: 5.00,  output: 20.00, cached: 2.50,  reasoning: 30.00,  cache_creation: 5.00  } },
   { pattern: "gpt-5.1-*",       pricing: { input: 4.00,  output: 16.00, cached: 2.00,  reasoning: 24.00,  cache_creation: 4.00  } },

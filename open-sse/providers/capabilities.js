@@ -518,6 +518,10 @@ export const PATTERN_CAPABILITIES = [
   { pattern: "*claude*opus-4.6*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
   { pattern: "*claude*opus-4.7*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
   { pattern: "*claude*opus-4.8*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
+  // Opus 5 / 5.5 — without this they fall through to *claude*opus* below and
+  // lose adaptive thinking + the 1M window (matters for every live-discovery
+  // lane: opencode, venice, commandcode, inxorastudio, agentrouter, 1min, infron).
+  { pattern: "*claude*opus-5*",   caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive", contextWindow: 1000000, maxOutput: 128000 } },
   { pattern: "*claude*sonnet-4.6*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
   { pattern: "*claude*sonnet-4.7*", caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-adaptive" } },
   { pattern: "*claude*haiku*",  caps: { vision: true, reasoning: true, search: true, thinkingFormat: "claude-budget" } },
@@ -554,7 +558,14 @@ export const PATTERN_CAPABILITIES = [
   // low/high/max only (default max). See moonshot.js registry note.
   { pattern: "*kimi-k3*",      caps: { vision: true, reasoning: true, thinkingFormat: "openai", thinkingCanDisable: false, thinkingLevels: ["low", "high", "max"], thinkingMaxEffort: true, contextWindow: 1048576, maxOutput: 1048576 } },
   // ── OpenAI GPT-6.x (vision + thinking + web search) ──────────────
-  { pattern: "*gpt-6*",         caps: { vision: true, reasoning: true, search: true, thinkingFormat: "openai", contextWindow: 272000, maxOutput: 128000 } },
+  // Window is 1 050 000, not the 272 000 of the 5.6 family: openrouter.ai/api/v1/models
+  // (2026-10-03) reports 1050000 for every gpt-6 id — astra, astra-pro, sol, sol-pro,
+  // luna, luna-pro, 6.1-sol, 6.1-sol-pro — and xkiro's hand-written openai/gpt-6-astra
+  // entry agrees. Whatever is declared here is STICKY (refineWithCatalog skips
+  // explicitKeys), so a stale number cannot be healed by the live catalog and would
+  // silently trim long contexts on every passthrough lane. Codex keeps its own lower
+  // 272 000 through its provider-exact entry, which wins ahead of this pattern.
+  { pattern: "*gpt-6*",         caps: { vision: true, reasoning: true, search: true, thinkingFormat: "openai", contextWindow: 1050000, maxOutput: 128000 } },
   { pattern: "*gpt-5*codex*",   caps: { reasoning: true, search: true, thinkingFormat: "openai", contextWindow: 400000, maxOutput: 128000 } },
   { pattern: "*gpt-5*",         caps: { vision: true, reasoning: true, search: true, thinkingFormat: "openai", contextWindow: 400000, maxOutput: 128000 } },
   { pattern: "*gpt-4o*",        caps: { vision: true, search: true, contextWindow: 128000, maxOutput: 16384 } },
