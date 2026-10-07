@@ -213,7 +213,11 @@ export async function compressWithPxpipe(body, {
  */
 export function formatPxpipeLog(stats) {
   if (!stats || !stats.tokensSaved) return null;
-  return `pxpipe saved ${stats.tokensSaved.toLocaleString()} tokens (${stats.tokensBefore.toLocaleString()} → ${stats.tokensAfter.toLocaleString()}, ${stats.imageCount} images)`;
+  // Locale pinned: these strings land in runtime diagnostics (chatCore logs) and
+  // in test assertions — a bare toLocaleString() emits U+202F grouping on ru-RU
+  // hosts, which breaks log greps/parsers and the suite.
+  const fmt = (n) => Number(n).toLocaleString("en-US");
+  return `pxpipe saved ${fmt(stats.tokensSaved)} tokens (${fmt(stats.tokensBefore)} → ${fmt(stats.tokensAfter)}, ${stats.imageCount} images)`;
 }
 
 /**
@@ -222,7 +226,8 @@ export function formatPxpipeLog(stats) {
 export function formatPxpipeSizeLog(diagnostics) {
   if (!diagnostics?.before || !diagnostics?.after) return null;
   const pct = diagnostics.before > 0 ? Math.round((1 - diagnostics.after / diagnostics.before) * 100) : 0;
-  return `${diagnostics.before.toLocaleString()} → ${diagnostics.after.toLocaleString()} tokens (-${pct}%)`;
+  const fmt = (n) => Number(n).toLocaleString("en-US");
+  return `${fmt(diagnostics.before)} → ${fmt(diagnostics.after)} tokens (-${pct}%)`;
 }
 
 /**
